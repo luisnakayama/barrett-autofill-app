@@ -2,6 +2,7 @@
 import re
 import json
 import os
+import io
 import shutil
 import streamlit as st
 from PIL import Image
@@ -134,24 +135,90 @@ def extrair_biometria_dupla_por_metades(paginas, lang: str = "por+eng"):
     return {}
 
 # =========================
-# Upload do PDF
+# Upload do PDF (robusto para Cloud)
 # =========================
-arquivo = st.file_uploader("Upload do PDF do exame", type=["pdf"])
+def _env_diag():
+    """Mostra no sidebar se Poppler/Tesseract estão disponíveis no ambiente."""
+    try:
+        pdftoppm = shutil.which("pdftoppm")
+        tesseract_bin = shutil.which("tesseract")
+        st.sidebar.markdown("### Diagnóstico do ambiente")
+        st.sidebar.write(f"pdftoppm: {'OK' if pdftoppm else 'NÃO ENCONTRADO'}")
+        st.sidebar.write(f"tesseract: {'OK' if tesseract_bin else 'NÃO ENCONTRADO'}")
+        st.sidebar.caption("Se aparecer 'NÃO ENCONTRADO', adicione em packages.txt: "
+                           "`poppler-utils` e/ou `tesseract-ocr`.")
+    except Exception:
+        pass
+
+_env_diag()
+
+MAX_MB = 80  # limite amigável
+arquivo = st.file_uploader("Upload do PDF do exame", type=["pdf"], accept_multiple_files=False)
+
+# Estados de sessão para bytes do PDF
+if "pdf_bytes" not in st.session_state:
+    st.session_state.pdf_bytes = None
+if "pdf_name" not in st.session_state:
+    st.session_state.pdf_name = None
+
 texto_topo = ""
 paginas = []
 img_preview = None
 
 if arquivo is not None:
-    file_bytes = arquivo.read()
+    st.caption(f"📄 Arquivo: **{arquivo.name}** | MIME: `{arquivo.type}` | Tamanho: {arquivo.size/1_048_576:.2f} MB")
+
+    if arquivo.type not in {"application/pdf", "application/x-pdf", "application/acrobat"}:
+        st.error("O arquivo não parece ser um PDF válido. Tente outro.")
+        st.stop()
+    if arquivo.size > MAX_MB * 1024 * 1024:
+        st.error(f"PDF maior que {MAX_MB} MB. Envie um arquivo menor.")
+        st.stop()
+
     try:
-        paginas = convert_from_bytes(file_bytes, dpi=300)
+        pdf_bytes = arquivo.getvalue()  # mais estável que .read() no Cloud
+        if not pdf_bytes:
+            st.error("Não consegui ler os bytes do PDF (arquivo vazio?).")
+            st.stop()
+        st.session_state.pdf_bytes = pdf_bytes
+        st.session_state.pdf_name = arquivo.name
     except Exception as e:
-        st.error(f"Erro ao ler PDF: {e}")
+        st.error("Falha ao carregar bytes do PDF.")
+        with st.expander("Detalhes técnicos (upload)"):
+            st.exception(e)
+        st.stop()
+
+# Converte somente a 1ª página (menos memória/erros)
+if st.session_state.pdf_bytes:
+    try:
+        paginas = convert_from_bytes(
+            st.session_state.pdf_bytes,
+            dpi=250,
+            first_page=1,
+            last_page=1
+        )
+    except Exception as e:
+        st.error("Erro ao converter PDF em imagem. No Streamlit Cloud, adicione 'poppler-utils' ao packages.txt.")
+        with st.expander("Detalhes técnicos (pdf2image)"):
+            st.exception(e)
+        paginas = []
 
     if paginas:
-        texto_topo = ocr_top_header_get_text(paginas[0], top_ratio=0.22, lang="por+eng")
-        img_preview = paginas[0].copy()
-        img_preview.thumbnail((900, 900))
+        try:
+            texto_topo = ocr_top_header_get_text(paginas[0], top_ratio=0.22, lang="por+eng")
+        except Exception as e:
+            st.warning("Não foi possível extrair o cabeçalho (OCR).")
+            with st.expander("Detalhes técnicos (OCR topo)"):
+                st.exception(e)
+
+        try:
+            img_preview = paginas[0].copy()
+            img_preview.thumbnail((900, 900))
+        except Exception as e:
+            img_preview = None
+            st.warning("Falha ao preparar a prévia da imagem.")
+            with st.expander("Detalhes técnicos (prévia)"):
+                st.exception(e)
 
 # =========================
 # Extrações (OCR)
@@ -189,7 +256,6 @@ def on_ac_input_change():
     """Callback: quando A-constant é digitada/alterada manualmente, dispara auto_run."""
     st.session_state.a_constant_val = st.session_state.get("ac_input", "").strip()
     if st.session_state.a_constant_val:
-        # Evita dependência do select de LIO
         st.session_state.selected_iol = st.session_state.selected_iol or "— selecionar —"
         st.session_state.auto_run = True
 
@@ -200,15 +266,25 @@ def on_lf_input_change():
         st.session_state.selected_iol = st.session_state.selected_iol or "— selecionar —"
         st.session_state.auto_run = True
 
-if arquivo is None:
+# =========================
+# UI principal
+# =========================
+if st.session_state.pdf_bytes is None:
     st.info("Faça o upload do PDF para extrair os dados.")
 else:
     # layout lado a lado
     col_preview, col_form = st.columns([1, 1.2], gap="large")
 
     with col_preview:
-        if img_preview:
-            st.image(img_preview, caption="Prévia da 1ª página do PDF", use_container_width=True)
+        if img_preview is not None:
+            try:
+                st.image(img_preview, caption="Prévia da 1ª página do PDF", use_container_width=True)
+            except Exception as e:
+                st.warning("Não consegui renderizar a prévia da imagem.")
+                with st.expander("Detalhes técnicos (st.image)"):
+                    st.exception(e)
+        else:
+            st.info("Sem prévia disponível.")
 
     with col_form:
         # dados default se vazio
@@ -264,7 +340,7 @@ else:
                 "Lens Factor (ex.: 2.00; -2.0 a 5.0)",
                 value=st.session_state.lens_factor_val,
                 key="lf_input",
-                on_change=on_lf_input_change,   # <<<<<<<<<<<<<<<<<< NEW
+                on_change=on_lf_input_change,
             )
             a_constant = st.text_input(
                 "A-constant (ex.: 119.0; 112 a 124.7)",
@@ -277,7 +353,7 @@ else:
                 "A-constant (ex.: 119.0; 112 a 124.7)",
                 value=st.session_state.a_constant_val,
                 key="ac_input",
-                on_change=on_ac_input_change,   # <<<<<<<<<<<<<<<<<< NEW
+                on_change=on_ac_input_change,
             )
             lens_factor = st.text_input(
                 "Lens Factor (ex.: 2.00; -2.0 a 5.0)",
@@ -288,175 +364,180 @@ else:
 
         st.markdown("[Abrir calculadora Barrett](https://calc.apacrs.org/barrett_universal2105/)", unsafe_allow_html=True)
 
-    st.divider()
+st.divider()
 
-    # ======= Configs de execução =======
-    st.subheader("Execução")
-    headless = st.checkbox("Executar em modo headless (sem abrir janela)", value=True)
-    nav_choice = st.radio("Navegador", ["Firefox", "Chrome"], index=0, horizontal=True)
+# ======= Configs de execução =======
+st.subheader("Execução")
+headless = st.checkbox("Executar em modo headless (sem abrir janela)", value=True)
+nav_choice = st.radio("Navegador", ["Firefox", "Chrome"], index=0, horizontal=True)
 
-    def parse_table_rows(table_el):
-        rows = table_el.find_elements(By.TAG_NAME, "tr")
-        out = []
-        for r in rows[1:]:
-            tds = r.find_elements(By.TAG_NAME, "td")
-            if len(tds) >= 3:
-                out.append({
-                    "IOL Power": tds[0].text.strip(),
-                    "Optic": tds[1].text.strip(),
-                    "Refraction": tds[2].text.strip()
-                })
-        return out
+def parse_table_rows(table_el):
+    rows = table_el.find_elements(By.TAG_NAME, "tr")
+    out = []
+    for r in rows[1:]:
+        tds = r.find_elements(By.TAG_NAME, "td")
+        if len(tds) >= 3:
+            out.append({
+                "IOL Power": tds[0].text.strip(),
+                "Optic": tds[1].text.strip(),
+                "Refraction": tds[2].text.strip()
+            })
+    return out
 
-    def build_firefox(headless_flag: bool):
-        opts = webdriver.FirefoxOptions()
-        if headless_flag:
-            opts.add_argument("-headless")
-        service = FirefoxService()          # Selenium Manager resolve geckodriver
-        return webdriver.Firefox(service=service, options=opts)
+def build_firefox(headless_flag: bool):
+    opts = webdriver.FirefoxOptions()
+    if headless_flag:
+        opts.add_argument("-headless")
+    service = FirefoxService()          # Selenium Manager resolve geckodriver
+    return webdriver.Firefox(service=service, options=opts)
 
-    def build_chrome(headless_flag: bool):
-        opts = webdriver.ChromeOptions()
-        if headless_flag:
-            opts.add_argument("--headless=new")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--window-size=1280,1000")
-        opts.add_argument("--disable-software-rasterizer")
-        opts.add_argument("--no-first-run")
-        opts.add_argument("--no-default-browser-check")
-        opts.add_argument("--remote-allow-origins=*")
-        # limpar ENV que aponta para chromedriver antigo
-        for var in ["WEBDRIVER_CHROME_DRIVER", "webdriver.chrome.driver", "CHROMEDRIVER", "CHROMEWEBDRIVER"]:
-            if var in os.environ:
-                del os.environ[var]
-        # tirar dirs com chromedriver do PATH
-        old_path = os.environ.get("PATH", "")
-        parts = old_path.split(os.pathsep)
-        filtered = []
-        for p in parts:
-            try:
-                found = shutil.which("chromedriver", path=p)
-            except Exception:
-                found = None
-            if not found:
-                filtered.append(p)
+def build_chrome(headless_flag: bool):
+    opts = webdriver.ChromeOptions()
+    if headless_flag:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--window-size=1280,1000")
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--no-default-browser-check")
+    opts.add_argument("--remote-allow-origins=*")
+    # limpar ENV que aponta para chromedriver antigo
+    for var in ["WEBDRIVER_CHROME_DRIVER", "webdriver.chrome.driver", "CHROMEDRIVER", "CHROMEWEBDRIVER"]:
+        if var in os.environ:
+            del os.environ[var]
+    # tirar dirs com chromedriver do PATH
+    old_path = os.environ.get("PATH", "")
+    parts = old_path.split(os.pathsep)
+    filtered = []
+    for p in parts:
         try:
-            os.environ["PATH"] = os.pathsep.join(filtered)
-            service = ChromeService()       # Selenium Manager resolve chromedriver
-            return webdriver.Chrome(service=service, options=opts)
-        finally:
-            os.environ["PATH"] = old_path
+            found = shutil.which("chromedriver", path=p)
+        except Exception:
+            found = None
+        if not found:
+            filtered.append(p)
+    try:
+        os.environ["PATH"] = os.pathsep.join(filtered)
+        service = ChromeService()       # Selenium Manager resolve chromedriver
+        return webdriver.Chrome(service=service, options=opts)
+    finally:
+        os.environ["PATH"] = old_path
 
-    def run_selenium_and_fetch(preferred: str):
-        last_error = None
-        order = [preferred] + (["Firefox", "Chrome"] if preferred == "Chrome" else ["Chrome"])
-        for choice in order:
-            try:
-                driver = build_firefox(headless) if choice == "Firefox" else build_chrome(headless)
-                wait = WebDriverWait(driver, 25)
+def run_selenium_and_fetch(preferred: str):
+    last_error = None
+    order = [preferred] + (["Firefox", "Chrome"] if preferred == "Chrome" else ["Chrome"])
+    for choice in order:
+        try:
+            driver = build_firefox(headless) if choice == "Firefox" else build_chrome(headless)
+            wait = WebDriverWait(driver, 25)
 
-                driver.get("https://calc.apacrs.org/barrett_universal2105/")
+            driver.get("https://calc.apacrs.org/barrett_universal2105/")
 
-                def fill_by_id(elem_id, value):
-                    el = wait.until(EC.presence_of_element_located((By.ID, elem_id)))
-                    el.clear()
-                    el.send_keys(str(value))
+            def fill_by_id(elem_id, value):
+                el = wait.until(EC.presence_of_element_located((By.ID, elem_id)))
+                el.clear()
+                el.send_keys(str(value))
 
-                # Identificação
-                fill_by_id("MainContent_DoctorName", doctor_name)
-                fill_by_id("MainContent_PatientName", patient_name)
+            # Identificação
+            fill_by_id("MainContent_DoctorName", st.session_state.get("doctor_name_val", "Luis"))
+            fill_by_id("MainContent_PatientName", st.session_state.get("patient_name_val", "AutoFill"))
 
-                # OD
-                fill_by_id("MainContent_Axlength", al_od)
-                fill_by_id("MainContent_MeasuredK1", k1_od)
-                fill_by_id("MainContent_MeasuredK2", k2_od)
-                fill_by_id("MainContent_OpticalACD", acd_od)
+            # OD
+            fill_by_id("MainContent_Axlength", al_od)
+            fill_by_id("MainContent_MeasuredK1", k1_od)
+            fill_by_id("MainContent_MeasuredK2", k2_od)
+            fill_by_id("MainContent_OpticalACD", acd_od)
 
-                # OS
-                fill_by_id("MainContent_Axlength0", al_os)
-                fill_by_id("MainContent_MeasuredK10", k1_os)
-                fill_by_id("MainContent_MeasuredK20", k2_os)
-                fill_by_id("MainContent_OpticalACD0", acd_os)
+            # OS
+            fill_by_id("MainContent_Axlength0", al_os)
+            fill_by_id("MainContent_MeasuredK10", k1_os)
+            fill_by_id("MainContent_MeasuredK20", k2_os)
+            fill_by_id("MainContent_OpticalACD0", acd_os)
 
-                # Modelo de LIO (se houver)
-                if st.session_state.get("selected_iol") and st.session_state["selected_iol"] != "— selecionar —":
-                    try:
-                        sel_el = wait.until(EC.presence_of_element_located((By.ID, "MainContent_IOLModel")))
-                        Select(sel_el).select_by_visible_text(st.session_state["selected_iol"])
-                        WebDriverWait(driver, 6).until(EC.staleness_of(sel_el))
-                    except Exception:
-                        pass
-
-                # Constantes manuais (sobrescrevem)
-                if const_tipo == "Lens Factor" and st.session_state.get("lens_factor_val", "").strip():
-                    fill_by_id("MainContent_LensFactor", st.session_state["lens_factor_val"].strip())
-                if const_tipo == "A-constant" and st.session_state.get("a_constant_val", "").strip():
-                    fill_by_id("MainContent_Aconstant", st.session_state["a_constant_val"].strip())
-
-                # Calcular
-                wait.until(EC.element_to_be_clickable((By.ID, "MainContent_Button1"))).click()
-                # Aba Universal Formula
-                driver.execute_script("__doPostBack('ctl00$MainContent$menuTabs','1');")
-
-                # Tabelas
-                wait.until(EC.presence_of_element_located((By.ID, "MainContent_Panel14")))
-                grid_od = driver.find_element(By.ID, "MainContent_GridView1")
-                grid_os = driver.find_element(By.ID, "MainContent_GridView2")
-                table_od = parse_table_rows(grid_od)
-                table_os = parse_table_rows(grid_os)
-
+            # Modelo de LIO (se houver)
+            if st.session_state.get("selected_iol") and st.session_state["selected_iol"] != "— selecionar —":
                 try:
-                    driver.quit()
+                    sel_el = wait.until(EC.presence_of_element_located((By.ID, "MainContent_IOLModel")))
+                    Select(sel_el).select_by_visible_text(st.session_state["selected_iol"])
+                    WebDriverWait(driver, 6).until(EC.staleness_of(sel_el))
                 except Exception:
                     pass
 
-                return {"OD": table_od, "OS": table_os}, choice
+            # Constantes manuais (sobrescrevem)
+            if const_tipo == "Lens Factor" and st.session_state.get("lens_factor_val", "").strip():
+                fill_by_id("MainContent_LensFactor", st.session_state["lens_factor_val"].strip())
+            if const_tipo == "A-constant" and st.session_state.get("a_constant_val", "").strip():
+                fill_by_id("MainContent_Aconstant", st.session_state["a_constant_val"].strip())
 
-            except Exception as e:
-                last_error = e
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                continue
-        raise last_error or RuntimeError("Falha ao iniciar navegador")
+            # Calcular
+            wait.until(EC.element_to_be_clickable((By.ID, "MainContent_Button1"))).click()
+            # Aba Universal Formula
+            driver.execute_script("__doPostBack('ctl00$MainContent$menuTabs','1');")
 
-    # --------- Auto-execução após seleção da LIO OU edição de constantes ---------
-    if st.session_state.auto_run:
-        st.session_state.auto_run = False
-        with st.status("Executando calculadora...", expanded=False):
+            # Tabelas
+            wait.until(EC.presence_of_element_located((By.ID, "MainContent_Panel14")))
+            grid_od = driver.find_element(By.ID, "MainContent_GridView1")
+            grid_os = driver.find_element(By.ID, "MainContent_GridView2")
+            table_od = parse_table_rows(grid_od)
+            table_os = parse_table_rows(grid_os)
+
             try:
-                tables, used = run_selenium_and_fetch(nav_choice)
-                st.session_state.tables = tables
-                st.session_state.used_browser = used
-            except Exception as e:
-                st.error(f"Erro ao executar Selenium: {e}")
+                driver.quit()
+            except Exception:
+                pass
 
-    # --------- Botão Recalcular ---------
-    if st.button("Recalcular"):
-        with st.status("Executando calculadora...", expanded=False):
+            return {"OD": table_od, "OS": table_os}, choice
+
+        except Exception as e:
+            last_error = e
             try:
-                tables, used = run_selenium_and_fetch(nav_choice)
-                st.session_state.tables = tables
-                st.session_state.used_browser = used
-            except Exception as e:
-                st.error(f"Erro ao executar Selenium: {e}")
+                driver.quit()
+            except Exception:
+                pass
+            continue
+    raise last_error or RuntimeError("Falha ao iniciar navegador")
 
-    # --------- Exibição das tabelas importadas ---------
-    if st.session_state.tables:
-        st.success(f"Tabelas importadas com sucesso (navegador: {st.session_state.used_browser}).")
-        colod, colos = st.columns(2)
-        with colod:
-            st.subheader("Sugestões (OD)")
-            if st.session_state.tables["OD"]:
-                st.dataframe(st.session_state.tables["OD"], use_container_width=True)
-            else:
-                st.info("Sem linhas em OD.")
-        with colos:
-            st.subheader("Sugestões (OS)")
-            if st.session_state.tables["OS"]:
-                st.dataframe(st.session_state.tables["OS"], use_container_width=True)
-            else:
-                st.info("Sem linhas em OS.")
+# --------- Auto-execução após seleção da LIO OU edição de constantes ---------
+if st.session_state.get("auto_run"):
+    st.session_state.auto_run = False
+    with st.status("Executando calculadora...", expanded=False):
+        try:
+            tables, used = run_selenium_and_fetch(nav_choice)
+            st.session_state.tables = tables
+            st.session_state.used_browser = used
+        except Exception as e:
+            st.error(f"Erro ao executar Selenium: {e}")
+
+# --------- Persistir nomes (para usar no Selenium) ---------
+# (mantém os últimos valores digitados)
+st.session_state["doctor_name_val"] = locals().get("doctor_name", st.session_state.get("doctor_name_val", "Luis"))
+st.session_state["patient_name_val"] = locals().get("patient_name", st.session_state.get("patient_name_val", "AutoFill"))
+
+# --------- Botão Recalcular ---------
+if st.button("Recalcular"):
+    with st.status("Executando calculadora...", expanded=False):
+        try:
+            tables, used = run_selenium_and_fetch(nav_choice)
+            st.session_state.tables = tables
+            st.session_state.used_browser = used
+        except Exception as e:
+            st.error(f"Erro ao executar Selenium: {e}")
+
+# --------- Exibição das tabelas importadas ---------
+if st.session_state.get("tables"):
+    st.success(f"Tabelas importadas com sucesso (navegador: {st.session_state.get('used_browser')}).")
+    colod, colos = st.columns(2)
+    with colod:
+        st.subheader("Sugestões (OD)")
+        if st.session_state.tables["OD"]:
+            st.dataframe(st.session_state.tables["OD"], use_container_width=True)
+        else:
+            st.info("Sem linhas em OD.")
+    with colos:
+        st.subheader("Sugestões (OS)")
+        if st.session_state.tables["OS"]:
+            st.dataframe(st.session_state.tables["OS"], use_container_width=True)
+        else:
+            st.info("Sem linhas em OS.")
