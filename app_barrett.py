@@ -4,6 +4,7 @@ import json
 import os
 import io
 import shutil
+import inspect
 import streamlit as st
 from PIL import Image
 import pytesseract
@@ -20,6 +21,14 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 st.set_page_config(page_title="Barrett AutoFill (PDF → OCR → Selenium)", layout="wide")
 st.title("Barrett AutoFill: OCR do exame + Preenchimento Automático")
 st.write("1) Faça upload do PDF da biometria. 2) Confira/edite os campos. 3) Ao escolher uma LIO, a calculadora roda automaticamente. Use Recalcular se ajustar valores.")
+
+# ========= Helper de compatibilidade para st.image =========
+def _img_kwargs():
+    params = inspect.signature(st.image).parameters
+    if "use_container_width" in params:
+        return dict(use_container_width=True)
+    else:
+        return dict(use_column_width=True)
 
 # =========================
 # IOL PRESETS (scrape consolidado)
@@ -278,7 +287,7 @@ else:
     with col_preview:
         if img_preview is not None:
             try:
-                st.image(img_preview, caption="Prévia da 1ª página do PDF", use_container_width=True)
+                st.image(img_preview, caption="Prévia da 1ª página do PDF", **_img_kwargs())
             except Exception as e:
                 st.warning("Não consegui renderizar a prévia da imagem.")
                 with st.expander("Detalhes técnicos (st.image)"):
@@ -511,7 +520,6 @@ if st.session_state.get("auto_run"):
             st.error(f"Erro ao executar Selenium: {e}")
 
 # --------- Persistir nomes (para usar no Selenium) ---------
-# (mantém os últimos valores digitados)
 st.session_state["doctor_name_val"] = locals().get("doctor_name", st.session_state.get("doctor_name_val", "Luis"))
 st.session_state["patient_name_val"] = locals().get("patient_name", st.session_state.get("patient_name_val", "AutoFill"))
 
