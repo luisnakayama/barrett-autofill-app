@@ -4,7 +4,7 @@ import os
 import io
 import shutil
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter
 import pytesseract
 from pdf2image import convert_from_bytes
 
@@ -18,10 +18,10 @@ from selenium.webdriver.chrome.service import Service as ChromeService
 
 st.set_page_config(page_title="Barrett AutoFill (PDF → OCR → Selenium)", layout="wide")
 st.title("Barrett AutoFill: OCR do exame + Preenchimento Automático")
-st.write("1) Faça upload do PDF da biometria. 2) Confira/edite os campos. 3) Ao escolher uma LIO, a calculadora roda automaticamente. Use Recalcular se ajustar valores.")
+st.write("1) Faça upload do PDF da biometria. 2) Confira/edite os campos. 3) Ao escolher uma LIO ou editar constantes, a calculadora roda automaticamente.")
 
 # =========================
-# IOL PRESETS (consolidado)
+# IOL PRESETS
 # =========================
 IOL_PRESETS = [
     {"label": "— selecionar —", "a_constant": "", "lens_factor": ""},
@@ -66,29 +66,36 @@ IOL_PRESETS = [
 PRESET_BY_LABEL = {p["label"]: p for p in IOL_PRESETS}
 
 # =========================
-# OCR helpers (específicos)
+# OCR helpers robustos
 # =========================
-NUM = r"([-+]?\d+(?:[.,]\d+)?)"  # aceita 12,34 ou 12.34
+OCR_DPI = 360  # aumente p/ 380–420 se necessário
+
+NUM = r"([-+]?\d+(?:[.,]\d+)?)"
 
 def _to_f(s: str) -> float:
     return float(str(s).replace(",", ".").strip())
 
-def _normalize(txt: str) -> str:
-    return txt.replace("\xa0", " ")
+def _clean_common_ocr(text: str) -> str:
+    # normaliza e corrige confusões comuns do OCR
+    t = text.replace("\xa0", " ")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = t.replace("AC0", "ACD").replace("AOD", "ACD")  # 0/O ↔ D
+    t = t.replace("M V", "MV").replace("M/V", "MV")
+    t = t.replace("Comp ,", "Comp.").replace("Comp ,", "Comp.").replace("Comp .", "Comp.")
+    return t
 
-# Padrões EXATOS conforme sua especificação:
-PAT_AL  = re.compile(r"Comp\.\s*AL\s*[:=]\s*" + NUM, re.IGNORECASE)
-PAT_MV  = re.compile(r"\bMV\b\s*[:=]\s*" + NUM + r"\s*/\s*" + NUM, re.IGNORECASE)
-PAT_ACD = re.compile(r"\bACD\b\s*[:=]\s*" + NUM, re.IGNORECASE)
+# padrões tolerantes a ruído/pontuação/linhas
+PAT_AL  = re.compile(r"C\s*o?\s*m\s*p\.?\s*A\s*L\s*[:=]\s*" + NUM, re.IGNORECASE)
+PAT_MV  = re.compile(r"M\s*V\s*[:=]\s*" + NUM + r"\s*/\s*" + NUM, re.IGNORECASE | re.DOTALL)
+PAT_ACD = re.compile(r"A\s*C\s*[D0]\s*[:=]\s*" + NUM, re.IGNORECASE)
 
 def _parse_eye_text_exact(txt: str) -> dict:
-    """Extrai AL, K1, K2 e ACD exatamente após os rótulos especificados."""
-    T = _normalize(txt)
+    T = _clean_common_ocr(txt)
+
     al = k1 = k2 = acd = None
 
     m = PAT_AL.search(T)
-    if m:
-        al = _to_f(m.group(1))
+    if m: al = _to_f(m.group(1))
 
     m = PAT_MV.search(T)
     if m:
@@ -96,38 +103,56 @@ def _parse_eye_text_exact(txt: str) -> dict:
         k2 = _to_f(m.group(2))
 
     m = PAT_ACD.search(T)
-    if m:
-        acd = _to_f(m.group(1))
+    if m: acd = _to_f(m.group(1))
 
     return {"AL": al, "K1": k1, "K2": k2, "ACD": acd}
+
+def _pp_half(img: Image.Image) -> Image.Image:
+    # tons de cinza + autocontraste + sharpen + upscaling ajuda no OCR
+    im = img.convert("L")
+    im = ImageOps.autocontrast(im, cutoff=2)
+    im = im.filter(ImageFilter.UnsharpMask(radius=1.3, percent=160, threshold=3))
+    w, h = im.size
+    im = im.resize((int(w*1.6), int(h*1.6)), Image.LANCZOS)
+    return im
+
+def _tess(page_img: Image.Image, lang="por+eng", psm="6") -> str:
+    # whitelist para forçar letras/dígitos relevantes
+    cfg = f'--oem 3 --psm {psm} -c preserve_interword_spaces=1 -c tessedit_char_whitelist=0123456789.,:/ACDMLPV '
+    return pytesseract.image_to_string(page_img, lang=lang, config=cfg)
 
 def ocr_top_header_get_text(imagem_pil, top_ratio: float = 0.22, lang: str = "por+eng") -> str:
     w, h = imagem_pil.size
     top_h = int(h * top_ratio)
-    header = imagem_pil.crop((0, 0, w, top_h))
-    return pytesseract.image_to_string(header, lang=lang, config="--psm 6")
+    header = imagem_pil.crop((0, 0, w, top_h)).convert("L")
+    header = ImageOps.autocontrast(header, cutoff=2)
+    return _tess(header, lang=lang, psm="6")
 
-def extrair_biometria_dupla_por_metades(paginas, lang: str = "por+eng", psm: str = "6"):
-    """Corta a 1ª página em metades: esquerda=OD, direita=OS; aplica parser exato."""
+def extrair_biometria_dupla_por_metades(paginas, lang: str = "por+eng") -> dict:
+    """Corta a 1ª página em metades (esq=OD, dir=OS) e extrai AL/MV/ACD."""
     if not paginas:
         return {}
+
     img = paginas[0].convert("RGB")
     w, h = img.size
     mid = w // 2
     left = img.crop((0, 0, mid, h))   # OD
     right = img.crop((mid, 0, w, h))  # OS
 
-    # OCR nas metades (PSM 6 costuma funcionar melhor aqui)
-    txt_left = pytesseract.image_to_string(left, lang=lang, config=f"--psm {psm}")
-    txt_right = pytesseract.image_to_string(right, lang=lang, config=f"--psm {psm}")
+    # pré-processa e tenta PSM 6; se faltar algo, tenta PSM 4
+    for psm_try in ("6", "4"):
+        L = _pp_half(left)
+        R = _pp_half(right)
+        txt_left = _tess(L, lang=lang, psm=psm_try)
+        txt_right = _tess(R, lang=lang, psm=psm_try)
 
-    od = _parse_eye_text_exact(txt_left)
-    os_ = _parse_eye_text_exact(txt_right)
+        od = _parse_eye_text_exact(txt_left)
+        os_ = _parse_eye_text_exact(txt_right)
 
-    # Considera "ok" somente se todos presentes
-    if all(v is not None for v in [od["AL"], od["K1"], od["K2"], od["ACD"],
-                                   os_["AL"], os_["K1"], os_["K2"], os_["ACD"]]):
-        return {"OD": od, "OS": os_}
+        if all(v is not None for v in [od["AL"], od["K1"], od["K2"], od["ACD"],
+                                       os_["AL"], os_["K1"], os_["K2"], os_["ACD"]]):
+            return {"OD": od, "OS": os_}
+
     return {}
 
 def extrair_patient_name_do_header(texto_header: str):
@@ -147,7 +172,7 @@ def extrair_patient_name_do_header(texto_header: str):
     return ""
 
 # =========================
-# Upload do PDF (robusto p/ Cloud)
+# Diagnóstico simples (sidebar)
 # =========================
 def _env_diag():
     try:
@@ -156,12 +181,15 @@ def _env_diag():
         st.sidebar.markdown("### Diagnóstico do ambiente")
         st.sidebar.write(f"pdftoppm: {'OK' if pdftoppm else 'NÃO ENCONTRADO'}")
         st.sidebar.write(f"tesseract: {'OK' if tesseract_bin else 'NÃO ENCONTRADO'}")
-        st.sidebar.caption("Se aparecer 'NÃO ENCONTRADO', adicione em packages.txt: `poppler-utils` e `tesseract-ocr`.")
+        st.sidebar.caption("Se 'NÃO ENCONTRADO', adicione em packages.txt: `poppler-utils` e `tesseract-ocr`.")
     except Exception:
         pass
 
 _env_diag()
 
+# =========================
+# Upload do PDF (Cloud-friendly)
+# =========================
 MAX_MB = 80
 arquivo = st.file_uploader("Upload do PDF do exame", type=["pdf"], accept_multiple_files=False)
 
@@ -182,7 +210,6 @@ if arquivo is not None:
     if arquivo.size > MAX_MB * 1024 * 1024:
         st.error(f"PDF maior que {MAX_MB} MB. Envie um arquivo menor.")
         st.stop()
-
     try:
         pdf_bytes = arquivo.getvalue()
         if not pdf_bytes:
@@ -195,25 +222,25 @@ if arquivo is not None:
         st.exception(e)
         st.stop()
 
-# Converte somente a 1ª página com boa qualidade
+# Converte apenas a 1ª página com boa qualidade
 if st.session_state.pdf_bytes:
     try:
         paginas = convert_from_bytes(
             st.session_state.pdf_bytes,
-            dpi=340,           # um pouco maior para robustez
+            dpi=OCR_DPI,
             first_page=1,
             last_page=1,
-            fmt="png"          # ajuda na renderização no Cloud
+            fmt="png"
         )
     except Exception as e:
-        st.error("Erro ao converter PDF em imagem. No Streamlit Cloud, adicione 'poppler-utils' ao packages.txt.")
+        st.error("Erro ao converter PDF em imagem. No Streamlit Cloud, adicione 'poppler-utils'.")
         st.exception(e)
         paginas = []
 
     if paginas:
         try:
             texto_topo = ocr_top_header_get_text(paginas[0], top_ratio=0.22, lang="por+eng")
-        except Exception as e:
+        except Exception:
             texto_topo = ""
         try:
             img_preview = paginas[0].copy()
@@ -222,11 +249,11 @@ if st.session_state.pdf_bytes:
             img_preview = None
 
 # =========================
-# Extrações (OCR) — modo metades, parser exato
+# Extrações (OCR) — metades, parser exato
 # =========================
 dados = {}
 if paginas:
-    dados = extrair_biometria_dupla_por_metades(paginas, lang="por+eng", psm="6")
+    dados = extrair_biometria_dupla_por_metades(paginas, lang="por+eng")
 
 patient_detected = extrair_patient_name_do_header(texto_topo) if texto_topo else ""
 
@@ -265,7 +292,7 @@ def on_lf_input_change():
         st.session_state.auto_run = True
 
 # =========================
-# UI principal (sem barras extras)
+# UI principal (enxuta)
 # =========================
 if st.session_state.pdf_bytes is None:
     st.info("Faça o upload do PDF para extrair os dados.")
@@ -497,7 +524,7 @@ if st.session_state.get("auto_run"):
         except Exception as e:
             st.error(f"Erro ao executar Selenium: {e}")
 
-# Persistência dos nomes (últimos digitados)
+# Persistir nomes digitados
 st.session_state["doctor_name_val"] = locals().get("doctor_name", st.session_state.get("doctor_name_val", "Luis"))
 st.session_state["patient_name_val"] = locals().get("patient_name", st.session_state.get("patient_name_val", "AutoFill"))
 
