@@ -3,19 +3,10 @@ import re
 import os
 import io
 import shutil
-import traceback
 import streamlit as st
-from copy import deepcopy
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image
 import pytesseract
 from pdf2image import convert_from_bytes
-
-# ======= PyMuPDF opcional (render nítido com zoom). Se indisponível, cai para pdf2image =======
-try:
-    import fitz  # PyMuPDF
-    HAS_PYMUPDF = True
-except Exception:
-    HAS_PYMUPDF = False
 
 # Selenium
 from selenium import webdriver
@@ -30,7 +21,7 @@ st.title("Barrett AutoFill: OCR do exame + Preenchimento Automático")
 st.write("1) Faça upload do PDF da biometria. 2) Confira/edite os campos. 3) Ao escolher uma LIO, a calculadora roda automaticamente. Use Recalcular se ajustar valores.")
 
 # =========================
-# IOL PRESETS
+# IOL PRESETS (consolidado)
 # =========================
 IOL_PRESETS = [
     {"label": "— selecionar —", "a_constant": "", "lens_factor": ""},
@@ -75,86 +66,102 @@ IOL_PRESETS = [
 PRESET_BY_LABEL = {p["label"]: p for p in IOL_PRESETS}
 
 # =========================
-# Utilitários / OCR (regras estritas)
+# OCR helpers (específicos)
 # =========================
-LEFT_IS_OD = True  # Se seu PDF vier invertido, mude para False
+NUM = r"([-+]?\d+(?:[.,]\d+)?)"  # aceita 12,34 ou 12.34
 
 def _to_f(s: str) -> float:
     return float(str(s).replace(",", ".").strip())
 
-def preprocess_for_ocr(img: Image.Image) -> Image.Image:
-    g = img.convert("L")
-    g = ImageOps.autocontrast(g, cutoff=2)
-    g = g.filter(ImageFilter.UnsharpMask(radius=1.3, percent=160, threshold=3))
-    return g
+def _normalize(txt: str) -> str:
+    return txt.replace("\xa0", " ")
 
-def ocr_text(img: Image.Image, lang="por+eng", psm="6") -> str:
-    return pytesseract.image_to_string(img, lang=lang, config=f"--oem 3 --psm {psm}")
+# Padrões EXATOS conforme sua especificação:
+PAT_AL  = re.compile(r"Comp\.\s*AL\s*[:=]\s*" + NUM, re.IGNORECASE)
+PAT_MV  = re.compile(r"\bMV\b\s*[:=]\s*" + NUM + r"\s*/\s*" + NUM, re.IGNORECASE)
+PAT_ACD = re.compile(r"\bACD\b\s*[:=]\s*" + NUM, re.IGNORECASE)
 
-def parse_eye_text_strict(txt: str) -> dict:
-    """
-    Regras fixas:
-      - AL  após:  'Comp. AL: <num>'
-      - MV  após:  'MV: <K1> / <K2>'
-      - ACD após:  'ACD: <num>' (aceita 'mm' no final)
-    """
-    T = txt.replace("\xa0", " ").replace(",", ".")
-    # AL
-    m_al = re.search(r"Comp\.?\s*AL\s*:\s*([0-9]+(?:\.[0-9]+)?)", T, flags=re.IGNORECASE)
-    al = _to_f(m_al.group(1)) if m_al else None
-    # MV: K1 / K2
-    m_mv = re.search(r"\bMV\b\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*([0-9]+(?:\.[0-9]+)?)", T, flags=re.IGNORECASE)
-    if m_mv:
-        k1 = _to_f(m_mv.group(1)); k2 = _to_f(m_mv.group(2))
-    else:
-        k1 = k2 = None
-    # ACD (estrito logo após 'ACD:')
-    m_acd = re.search(r"\bACD\b\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mm)?\b", T, flags=re.IGNORECASE)
-    acd = _to_f(m_acd.group(1)) if m_acd else None
+def _parse_eye_text_exact(txt: str) -> dict:
+    """Extrai AL, K1, K2 e ACD exatamente após os rótulos especificados."""
+    T = _normalize(txt)
+    al = k1 = k2 = acd = None
+
+    m = PAT_AL.search(T)
+    if m:
+        al = _to_f(m.group(1))
+
+    m = PAT_MV.search(T)
+    if m:
+        k1 = _to_f(m.group(1))
+        k2 = _to_f(m.group(2))
+
+    m = PAT_ACD.search(T)
+    if m:
+        acd = _to_f(m.group(1))
+
     return {"AL": al, "K1": k1, "K2": k2, "ACD": acd}
-
-def extrair_biometria_dupla_por_metades_estrito(pagina: Image.Image, lang="por+eng") -> dict:
-    w, h = pagina.size
-    mid = w // 2
-    left = pagina.crop((0, 0, mid, h))
-    right = pagina.crop((mid, 0, w, h))
-
-    left_txt = ocr_text(preprocess_for_ocr(left), lang=lang, psm="6")
-    right_txt = ocr_text(preprocess_for_ocr(right), lang=lang, psm="6")
-
-    left_vals = parse_eye_text_strict(left_txt)
-    right_vals = parse_eye_text_strict(right_txt)
-
-    if LEFT_IS_OD:
-        return {"OD": left_vals, "OS": right_vals}
-    else:
-        return {"OD": right_vals, "OS": left_vals}
 
 def ocr_top_header_get_text(imagem_pil, top_ratio: float = 0.22, lang: str = "por+eng") -> str:
     w, h = imagem_pil.size
     top_h = int(h * top_ratio)
     header = imagem_pil.crop((0, 0, w, top_h))
-    return ocr_text(header, lang=lang, psm="6")
+    return pytesseract.image_to_string(header, lang=lang, config="--psm 6")
+
+def extrair_biometria_dupla_por_metades(paginas, lang: str = "por+eng", psm: str = "6"):
+    """Corta a 1ª página em metades: esquerda=OD, direita=OS; aplica parser exato."""
+    if not paginas:
+        return {}
+    img = paginas[0].convert("RGB")
+    w, h = img.size
+    mid = w // 2
+    left = img.crop((0, 0, mid, h))   # OD
+    right = img.crop((mid, 0, w, h))  # OS
+
+    # OCR nas metades (PSM 6 costuma funcionar melhor aqui)
+    txt_left = pytesseract.image_to_string(left, lang=lang, config=f"--psm {psm}")
+    txt_right = pytesseract.image_to_string(right, lang=lang, config=f"--psm {psm}")
+
+    od = _parse_eye_text_exact(txt_left)
+    os_ = _parse_eye_text_exact(txt_right)
+
+    # Considera "ok" somente se todos presentes
+    if all(v is not None for v in [od["AL"], od["K1"], od["K2"], od["ACD"],
+                                   os_["AL"], os_["K1"], os_["K2"], os_["ACD"]]):
+        return {"OD": od, "OS": os_}
+    return {}
+
+def extrair_patient_name_do_header(texto_header: str):
+    blacklist = [
+        "report date","biometria","cálculo iol","page","id:","dob:","gender:",
+        "r. ","av. ","rua ","tel","cep","http","www","e-mail","email",
+        "printing images","admin/","instituto","hospital"
+    ]
+    linhas = [ln.strip() for ln in texto_header.splitlines() if ln.strip()]
+    for ln in linhas:
+        low = ln.lower()
+        if any(b in low for b in blacklist):
+            continue
+        candidato = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ' \-\.]", "", ln).strip()
+        if len(candidato.split()) >= 2 and 2 <= len(candidato) <= 80:
+            return candidato
+    return ""
 
 # =========================
-# Render da 1ª página (PyMuPDF → fallback pdf2image)
+# Upload do PDF (robusto p/ Cloud)
 # =========================
-def render_first_page(pdf_bytes: bytes, zoom: float = 3.2, fallback_dpi: int = 380) -> Image.Image:
-    if HAS_PYMUPDF:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        if doc.page_count == 0:
-            return None
-        page = doc.load_page(0)
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        im = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-        return im
-    pages = convert_from_bytes(pdf_bytes, dpi=int(fallback_dpi), first_page=1, last_page=1, fmt="png")
-    return pages[0].convert("RGB") if pages else None
+def _env_diag():
+    try:
+        pdftoppm = shutil.which("pdftoppm")
+        tesseract_bin = shutil.which("tesseract")
+        st.sidebar.markdown("### Diagnóstico do ambiente")
+        st.sidebar.write(f"pdftoppm: {'OK' if pdftoppm else 'NÃO ENCONTRADO'}")
+        st.sidebar.write(f"tesseract: {'OK' if tesseract_bin else 'NÃO ENCONTRADO'}")
+        st.sidebar.caption("Se aparecer 'NÃO ENCONTRADO', adicione em packages.txt: `poppler-utils` e `tesseract-ocr`.")
+    except Exception:
+        pass
 
-# =========================
-# Upload do PDF (simples)
-# =========================
+_env_diag()
+
 MAX_MB = 80
 arquivo = st.file_uploader("Upload do PDF do exame", type=["pdf"], accept_multiple_files=False)
 
@@ -168,13 +175,14 @@ paginas = []
 img_preview = None
 
 if arquivo is not None:
-    st.caption(f"📄 Arquivo: **{arquivo.name}** | Tamanho: {arquivo.size/1_048_576:.2f} MB")
+    st.caption(f"📄 Arquivo: **{arquivo.name}** | MIME: `{arquivo.type}` | Tamanho: {arquivo.size/1_048_576:.2f} MB")
     if arquivo.type not in {"application/pdf", "application/x-pdf", "application/acrobat"}:
-        st.error("O arquivo não parece ser um PDF válido.")
+        st.error("O arquivo não parece ser um PDF válido. Tente outro.")
         st.stop()
     if arquivo.size > MAX_MB * 1024 * 1024:
         st.error(f"PDF maior que {MAX_MB} MB. Envie um arquivo menor.")
         st.stop()
+
     try:
         pdf_bytes = arquivo.getvalue()
         if not pdf_bytes:
@@ -184,76 +192,47 @@ if arquivo is not None:
         st.session_state.pdf_name = arquivo.name
     except Exception as e:
         st.error("Falha ao carregar bytes do PDF.")
-        st.code(''.join(traceback.format_exception(None, e, e.__traceback__)))
+        st.exception(e)
         st.stop()
 
-# Converte só a 1ª página
+# Converte somente a 1ª página com boa qualidade
 if st.session_state.pdf_bytes:
     try:
-        base = render_first_page(st.session_state.pdf_bytes, zoom=3.2, fallback_dpi=380)
-        if base is None:
-            st.error("PDF sem páginas.")
-        else:
-            img_preview = base.copy()
-            img_preview.thumbnail((1100, 1100))
-            paginas = [base]
+        paginas = convert_from_bytes(
+            st.session_state.pdf_bytes,
+            dpi=340,           # um pouco maior para robustez
+            first_page=1,
+            last_page=1,
+            fmt="png"          # ajuda na renderização no Cloud
+        )
     except Exception as e:
-        st.error("Falha ao renderizar a primeira página.")
-        st.code(''.join(traceback.format_exception(None, e, e.__traceback__)))
+        st.error("Erro ao converter PDF em imagem. No Streamlit Cloud, adicione 'poppler-utils' ao packages.txt.")
+        st.exception(e)
         paginas = []
 
+    if paginas:
+        try:
+            texto_topo = ocr_top_header_get_text(paginas[0], top_ratio=0.22, lang="por+eng")
+        except Exception as e:
+            texto_topo = ""
+        try:
+            img_preview = paginas[0].copy()
+            img_preview.thumbnail((1100, 1100))
+        except Exception:
+            img_preview = None
+
 # =========================
-# OCR & Extrações (STRICT) + merge seguro em defaults
+# Extrações (OCR) — modo metades, parser exato
 # =========================
-DEFAULTS = {"OD": {"AL": 23.50, "K1": 43.50, "K2": 44.00, "ACD": 3.20},
-            "OS": {"AL": 23.60, "K1": 43.80, "K2": 44.05, "ACD": 3.30}}
-
-def merge_with_defaults(extracted: dict, defaults: dict) -> dict:
-    out = deepcopy(defaults)
-    for eye in ["OD", "OS"]:
-        e = (extracted or {}).get(eye, {})
-        for k in ["AL", "K1", "K2", "ACD"]:
-            val = e.get(k, None)
-            if isinstance(val, (int, float)):
-                out[eye][k] = float(val)
-    return out
-
-dados_extr = {}
+dados = {}
 if paginas:
-    try:
-        dados_extr = extrair_biometria_dupla_por_metades_estrito(paginas[0], lang="por+eng")
-    except Exception as e:
-        st.warning("OCR falhou, usando valores padrão.")
-        st.code(''.join(traceback.format_exception(None, e, e.__traceback__)))
-        dados_extr = {}
+    dados = extrair_biometria_dupla_por_metades(paginas, lang="por+eng", psm="6")
 
-dados = merge_with_defaults(dados_extr, DEFAULTS)
-
-# Nome do paciente (opcional, do topo)
-patient_detected = ""
-if paginas:
-    try:
-        texto_topo = ocr_top_header_get_text(paginas[0], top_ratio=0.22, lang="por+eng")
-        linhas = [ln.strip() for ln in texto_topo.splitlines() if ln.strip()]
-        blacklist = ["report date","biometria","cálculo iol","page","id:","dob:","gender:",
-                     "r. ","av. ","rua ","tel","cep","http","www","e-mail","email",
-                     "printing images","admin/","instituto","hospital"]
-        for ln in linhas:
-            low = ln.lower()
-            if any(b in low for b in blacklist):
-                continue
-            cand = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ' \-\.]", "", ln).strip()
-            if len(cand.split()) >= 2 and 2 <= len(cand) <= 80:
-                patient_detected = cand
-                break
-    except Exception:
-        patient_detected = ""
+patient_detected = extrair_patient_name_do_header(texto_topo) if texto_topo else ""
 
 st.divider()
 
-# =========================
-# Sessão/estado para auto-execução
-# =========================
+# =============== Estado global ===============
 if "selected_iol" not in st.session_state:
     st.session_state.selected_iol = "— selecionar —"
 if "a_constant_val" not in st.session_state:
@@ -286,7 +265,7 @@ def on_lf_input_change():
         st.session_state.auto_run = True
 
 # =========================
-# UI principal (somente a seção "Verifique e edite os dados")
+# UI principal (sem barras extras)
 # =========================
 if st.session_state.pdf_bytes is None:
     st.info("Faça o upload do PDF para extrair os dados.")
@@ -295,25 +274,26 @@ else:
 
     with col_preview:
         if img_preview is not None:
-            try:
-                st.image(img_preview, caption="Prévia da 1ª página do PDF", use_column_width=True)
-            except Exception as e:
-                st.warning("Não consegui renderizar a prévia da imagem.")
-                st.code(''.join(traceback.format_exception(None, e, e.__traceback__)))
+            st.image(img_preview, caption="Prévia da 1ª página do PDF", use_column_width=True)
         else:
             st.info("Sem prévia disponível.")
 
     with col_form:
+        if not dados:
+            st.warning("Não consegui extrair automaticamente. Preencha/ajuste manualmente.")
+            dados = {"OD": {"AL": 23.50, "K1": 43.50, "K2": 44.00, "ACD": 3.20},
+                     "OS": {"AL": 23.60, "K1": 43.80, "K2": 44.05, "ACD": 3.30}}
+
         st.subheader("Verifique e edite os dados")
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**OD (Right)**")
+            st.markdown("OD (Right)")
             al_od = st.number_input("AL (OD, mm)", value=float(dados["OD"]["AL"]), format="%.2f")
             k1_od = st.number_input("K1 (OD, D)", value=float(dados["OD"]["K1"]), format="%.2f")
             k2_od = st.number_input("K2 (OD, D)", value=float(dados["OD"]["K2"]), format="%.2f")
             acd_od = st.number_input("ACD (OD, mm)", value=float(dados["OD"]["ACD"]), format="%.2f")
         with c2:
-            st.markdown("**OS (Left)**")
+            st.markdown("OS (Left)")
             al_os = st.number_input("AL (OS, mm)", value=float(dados["OS"]["AL"]), format="%.2f")
             k1_os = st.number_input("K1 (OS, D)", value=float(dados["OS"]["K1"]), format="%.2f")
             k2_os = st.number_input("K2 (OS, D)", value=float(dados["OS"]["K2"]), format="%.2f")
@@ -322,9 +302,9 @@ else:
         st.subheader("Identificação")
         colid1, colid2 = st.columns(2)
         with colid1:
-            doctor_name = st.text_input("Doctor Name", value=st.session_state.get("doctor_name_val", "Luis"))
+            doctor_name = st.text_input("Doctor Name", value="Luis")
         with colid2:
-            patient_name = st.text_input("Patient Name (obrigatório)", value=st.session_state.get("patient_name_val", patient_detected or "AutoFill"))
+            patient_name = st.text_input("Patient Name (obrigatório)", value=patient_detected or "AutoFill")
 
         st.subheader("Constante da Lente")
         const_tipo = st.radio(
@@ -434,7 +414,6 @@ def build_chrome(headless_flag: bool):
         os.environ["PATH"] = old_path
 
 def run_selenium_and_fetch(preferred: str):
-    const_tipo_current = st.session_state.get("const_tipo_radio", "A-constant")
     last_error = None
     order = [preferred] + (["Firefox", "Chrome"] if preferred == "Chrome" else ["Chrome"])
     for choice in order:
@@ -475,9 +454,9 @@ def run_selenium_and_fetch(preferred: str):
                     pass
 
             # Constantes manuais (sobrescrevem)
-            if const_tipo_current == "Lens Factor" and st.session_state.get("lens_factor_val", "").strip():
+            if const_tipo == "Lens Factor" and st.session_state.get("lens_factor_val", "").strip():
                 fill_by_id("MainContent_LensFactor", st.session_state["lens_factor_val"].strip())
-            if const_tipo_current == "A-constant" and st.session_state.get("a_constant_val", "").strip():
+            if const_tipo == "A-constant" and st.session_state.get("a_constant_val", "").strip():
                 fill_by_id("MainContent_Aconstant", st.session_state["a_constant_val"].strip())
 
             # Calcular
@@ -507,7 +486,7 @@ def run_selenium_and_fetch(preferred: str):
             continue
     raise last_error or RuntimeError("Falha ao iniciar navegador")
 
-# --------- Auto-execução após seleção da LIO OU edição de constantes ---------
+# --------- Auto-execução após seleção/edição ---------
 if st.session_state.get("auto_run"):
     st.session_state.auto_run = False
     with st.status("Executando calculadora...", expanded=False):
@@ -517,9 +496,8 @@ if st.session_state.get("auto_run"):
             st.session_state.used_browser = used
         except Exception as e:
             st.error(f"Erro ao executar Selenium: {e}")
-            st.code(''.join(traceback.format_exception(None, e, e.__traceback__)))
 
-# --------- Persistir nomes (para usar no Selenium) ---------
+# Persistência dos nomes (últimos digitados)
 st.session_state["doctor_name_val"] = locals().get("doctor_name", st.session_state.get("doctor_name_val", "Luis"))
 st.session_state["patient_name_val"] = locals().get("patient_name", st.session_state.get("patient_name_val", "AutoFill"))
 
@@ -532,7 +510,6 @@ if st.button("Recalcular"):
             st.session_state.used_browser = used
         except Exception as e:
             st.error(f"Erro ao executar Selenium: {e}")
-            st.code(''.join(traceback.format_exception(None, e, e.__traceback__)))
 
 # --------- Exibição das tabelas importadas ---------
 if st.session_state.get("tables"):
