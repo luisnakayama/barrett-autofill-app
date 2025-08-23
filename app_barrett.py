@@ -96,30 +96,24 @@ def parse_eye_text_strict(txt: str) -> dict:
     Regras fixas:
       - AL  após:  'Comp. AL: <num>'
       - MV  após:  'MV: <K1> / <K2>'
-      - ACD após:  'ACD: <num>'
-    Aceita vírgula decimal.
+      - ACD após:  'ACD: <num>' (aceita 'mm' no final)
     """
     T = txt.replace("\xa0", " ").replace(",", ".")
     # AL
     m_al = re.search(r"Comp\.?\s*AL\s*:\s*([0-9]+(?:\.[0-9]+)?)", T, flags=re.IGNORECASE)
     al = _to_f(m_al.group(1)) if m_al else None
     # MV: K1 / K2
-    m_mv = re.search(r"MV\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*([0-9]+(?:\.[0-9]+)?)", T, flags=re.IGNORECASE)
+    m_mv = re.search(r"\bMV\b\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*([0-9]+(?:\.[0-9]+)?)", T, flags=re.IGNORECASE)
     if m_mv:
         k1 = _to_f(m_mv.group(1)); k2 = _to_f(m_mv.group(2))
     else:
         k1 = k2 = None
-    # ACD
-    m_acd = re.search(r"\bACD\b\s*:\s*([0-9]+(?:\.[0-9]+)?)", T, flags=re.IGNORECASE)
+    # ACD (estrito logo após 'ACD:')
+    m_acd = re.search(r"\bACD\b\s*:\s*([0-9]+(?:\.[0-9]+)?)\s*(?:mm)?\b", T, flags=re.IGNORECASE)
     acd = _to_f(m_acd.group(1)) if m_acd else None
     return {"AL": al, "K1": k1, "K2": k2, "ACD": acd}
 
 def extrair_biometria_dupla_por_metades_estrito(pagina: Image.Image, lang="por+eng") -> dict:
-    """
-    Divide a 1ª página: metade esquerda e direita.
-    Se LEFT_IS_OD=True:  esquerda->OD, direita->OS
-    Caso contrário:      esquerda->OS, direita->OD
-    """
     w, h = pagina.size
     mid = w // 2
     left = pagina.crop((0, 0, mid, h))
@@ -240,7 +234,6 @@ patient_detected = ""
 if paginas:
     try:
         texto_topo = ocr_top_header_get_text(paginas[0], top_ratio=0.22, lang="por+eng")
-        # extração simples de nome (heurística leve)
         linhas = [ln.strip() for ln in texto_topo.splitlines() if ln.strip()]
         blacklist = ["report date","biometria","cálculo iol","page","id:","dob:","gender:",
                      "r. ","av. ","rua ","tel","cep","http","www","e-mail","email",
@@ -548,12 +541,12 @@ if st.session_state.get("tables"):
     with colod:
         st.subheader("Sugestões (OD)")
         if st.session_state.tables["OD"]:
-            st.dataframe(st.session_state.tables["OD"], use_column_width=True)
+            st.dataframe(st.session_state.tables["OD"], use_container_width=True)
         else:
             st.info("Sem linhas em OD.")
     with colos:
         st.subheader("Sugestões (OS)")
         if st.session_state.tables["OS"]:
-            st.dataframe(st.session_state.tables["OS"], use_column_width=True)
+            st.dataframe(st.session_state.tables["OS"], use_container_width=True)
         else:
             st.info("Sem linhas em OS.")
