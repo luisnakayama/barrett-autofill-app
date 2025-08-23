@@ -1,8 +1,10 @@
 # app_barrett.py
 import re
+import json
 import os
 import io
 import shutil
+import traceback
 import streamlit as st
 from PIL import Image, ImageOps, ImageFilter
 import pytesseract
@@ -16,9 +18,12 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.firefox.service import Service as FirefoxService
 from selenium.webdriver.chrome.service import Service as ChromeService
 
+# =========================
+# Config & título
+# =========================
 st.set_page_config(page_title="Barrett AutoFill (PDF → OCR → Selenium)", layout="wide")
 st.title("Barrett AutoFill: OCR do exame + Preenchimento Automático")
-st.write("1) Faça upload do PDF da biometria. 2) Confira/edite os campos. 3) Ao escolher uma LIO ou editar constantes, a calculadora roda automaticamente.")
+st.write("1) Faça upload do PDF da biometria. 2) Confira/edite os campos. 3) Ao escolher uma LIO ou alterar a constante, a calculadora roda automaticamente (ou use Recalcular).")
 
 # =========================
 # IOL PRESETS
@@ -66,96 +71,36 @@ IOL_PRESETS = [
 PRESET_BY_LABEL = {p["label"]: p for p in IOL_PRESETS}
 
 # =========================
-# OCR helpers robustos
+# Utilitários OCR
 # =========================
-OCR_DPI = 360  # aumente p/ 380–420 se necessário
-
-NUM = r"([-+]?\d+(?:[.,]\d+)?)"
-
 def _to_f(s: str) -> float:
     return float(str(s).replace(",", ".").strip())
 
-def _clean_common_ocr(text: str) -> str:
-    # normaliza e corrige confusões comuns do OCR
-    t = text.replace("\xa0", " ")
-    t = re.sub(r"[ \t]+", " ", t)
-    t = t.replace("AC0", "ACD").replace("AOD", "ACD")  # 0/O ↔ D
-    t = t.replace("M V", "MV").replace("M/V", "MV")
-    t = t.replace("Comp ,", "Comp.").replace("Comp ,", "Comp.").replace("Comp .", "Comp.")
-    return t
-
-# padrões tolerantes a ruído/pontuação/linhas
-PAT_AL  = re.compile(r"C\s*o?\s*m\s*p\.?\s*A\s*L\s*[:=]\s*" + NUM, re.IGNORECASE)
-PAT_MV  = re.compile(r"M\s*V\s*[:=]\s*" + NUM + r"\s*/\s*" + NUM, re.IGNORECASE | re.DOTALL)
-PAT_ACD = re.compile(r"A\s*C\s*[D0]\s*[:=]\s*" + NUM, re.IGNORECASE)
-
-def _parse_eye_text_exact(txt: str) -> dict:
-    T = _clean_common_ocr(txt)
-
-    al = k1 = k2 = acd = None
-
-    m = PAT_AL.search(T)
-    if m: al = _to_f(m.group(1))
-
-    m = PAT_MV.search(T)
-    if m:
-        k1 = _to_f(m.group(1))
-        k2 = _to_f(m.group(2))
-
-    m = PAT_ACD.search(T)
-    if m: acd = _to_f(m.group(1))
-
-    return {"AL": al, "K1": k1, "K2": k2, "ACD": acd}
-
-def _pp_half(img: Image.Image) -> Image.Image:
-    # tons de cinza + autocontraste + sharpen + upscaling ajuda no OCR
-    im = img.convert("L")
-    im = ImageOps.autocontrast(im, cutoff=2)
-    im = im.filter(ImageFilter.UnsharpMask(radius=1.3, percent=160, threshold=3))
-    w, h = im.size
-    im = im.resize((int(w*1.6), int(h*1.6)), Image.LANCZOS)
-    return im
-
-def _tess(page_img: Image.Image, lang="por+eng", psm="6") -> str:
-    # whitelist para forçar letras/dígitos relevantes
-    cfg = f'--oem 3 --psm {psm} -c preserve_interword_spaces=1 -c tessedit_char_whitelist=0123456789.,:/ACDMLPV '
-    return pytesseract.image_to_string(page_img, lang=lang, config=cfg)
-
-def ocr_top_header_get_text(imagem_pil, top_ratio: float = 0.22, lang: str = "por+eng") -> str:
-    w, h = imagem_pil.size
-    top_h = int(h * top_ratio)
-    header = imagem_pil.crop((0, 0, w, top_h)).convert("L")
-    header = ImageOps.autocontrast(header, cutoff=2)
-    return _tess(header, lang=lang, psm="6")
-
-def extrair_biometria_dupla_por_metades(paginas, lang: str = "por+eng") -> dict:
-    """Corta a 1ª página em metades (esq=OD, dir=OS) e extrai AL/MV/ACD."""
-    if not paginas:
-        return {}
-
-    img = paginas[0].convert("RGB")
+def preprocess_for_ocr(img: Image.Image) -> Image.Image:
+    # super-amostra antes do OCR (ajuda dígitos pequenos/borrados)
     w, h = img.size
-    mid = w // 2
-    left = img.crop((0, 0, mid, h))   # OD
-    right = img.crop((mid, 0, w, h))  # OS
+    img = img.resize((int(w * 1.8), int(h * 1.8)), Image.BICUBIC)
+    # grayscale + contraste + sharpen
+    img = img.convert("L")
+    img = ImageOps.autocontrast(img, cutoff=2)
+    img = img.filter(ImageFilter.UnsharpMask(radius=1.6, percent=180, threshold=2))
+    # binarização suave para destacar números
+    img = img.point(lambda p: 255 if p > 180 else 0)
+    return img
 
-    # pré-processa e tenta PSM 6; se faltar algo, tenta PSM 4
-    for psm_try in ("6", "4"):
-        L = _pp_half(left)
-        R = _pp_half(right)
-        txt_left = _tess(L, lang=lang, psm=psm_try)
-        txt_right = _tess(R, lang=lang, psm=psm_try)
+def ocr_text(img: Image.Image, psm: str = "6") -> str:
+    # psm 6 = parágrafos; 11 = linha única (fallback)
+    return pytesseract.image_to_string(img, lang="por+eng", config=f"--psm {psm}")
 
-        od = _parse_eye_text_exact(txt_left)
-        os_ = _parse_eye_text_exact(txt_right)
+def ocr_top_header_get_text(img: Image.Image, top_ratio: float = 0.22) -> str:
+    w, h = img.size
+    top_h = int(h * top_ratio)
+    header = img.crop((0, 0, w, top_h))
+    # header usa OCR "texto" (sem binarizar forte) para pegar nome
+    txt = pytesseract.image_to_string(header, lang="por+eng", config="--psm 6")
+    return txt
 
-        if all(v is not None for v in [od["AL"], od["K1"], od["K2"], od["ACD"],
-                                       os_["AL"], os_["K1"], os_["K2"], os_["ACD"]]):
-            return {"OD": od, "OS": os_}
-
-    return {}
-
-def extrair_patient_name_do_header(texto_header: str):
+def extrair_patient_name_do_header(texto_header: str) -> str:
     blacklist = [
         "report date","biometria","cálculo iol","page","id:","dob:","gender:",
         "r. ","av. ","rua ","tel","cep","http","www","e-mail","email",
@@ -171,24 +116,54 @@ def extrair_patient_name_do_header(texto_header: str):
             return candidato
     return ""
 
-# =========================
-# Diagnóstico simples (sidebar)
-# =========================
-def _env_diag():
-    try:
-        pdftoppm = shutil.which("pdftoppm")
-        tesseract_bin = shutil.which("tesseract")
-        st.sidebar.markdown("### Diagnóstico do ambiente")
-        st.sidebar.write(f"pdftoppm: {'OK' if pdftoppm else 'NÃO ENCONTRADO'}")
-        st.sidebar.write(f"tesseract: {'OK' if tesseract_bin else 'NÃO ENCONTRADO'}")
-        st.sidebar.caption("Se 'NÃO ENCONTRADO', adicione em packages.txt: `poppler-utils` e `tesseract-ocr`.")
-    except Exception:
-        pass
+def _parse_eye_text(txt: str) -> dict:
+    """Extrai estritamente:
+       Comp. AL: <num>
+       MV: <K1> / <K2>
+       ACD: <num>
+    """
+    t = txt.replace(",", ".")
+    # AL
+    m_al = re.search(r"Comp\.?\s*AL\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", t, re.IGNORECASE)
+    al = _to_f(m_al.group(1)) if m_al else None
+    # MV → K1 / K2
+    m_mv = re.search(r"\bMV\b\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*([0-9]+(?:\.[0-9]+)?)", t, re.IGNORECASE)
+    k1 = _to_f(m_mv.group(1)) if m_mv else None
+    k2 = _to_f(m_mv.group(2)) if m_mv else None
+    # ACD
+    m_acd = re.search(r"\bACD\b\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)", t, re.IGNORECASE)
+    acd = _to_f(m_acd.group(1)) if m_acd else None
+    return {"AL": al, "K1": k1, "K2": k2, "ACD": acd}
 
-_env_diag()
+def extrair_biometria_dupla_por_metades(pil_page: Image.Image) -> dict:
+    """Corta a 1ª página em duas metades (esq=OD, dir=OS), pré-processa e faz OCR+parse.
+       Tenta PSM 6; se faltar algo, tenta PSM 11.
+    """
+    w, h = pil_page.size
+    mid = w // 2
+    left = pil_page.crop((0, 0, mid, h))
+    right = pil_page.crop((mid, 0, w, h))
+
+    # 1ª passada (psm 6)
+    ltxt = ocr_text(preprocess_for_ocr(left), psm="6")
+    rtxt = ocr_text(preprocess_for_ocr(right), psm="6")
+    od = _parse_eye_text(ltxt)
+    os_ = _parse_eye_text(rtxt)
+
+    # fallback se faltou algo
+    if not all(v is not None for v in [od["AL"], od["K1"], od["K2"], od["ACD"]]):
+        ltxt2 = ocr_text(preprocess_for_ocr(left), psm="11")
+        od = _parse_eye_text(ltxt2)
+    if not all(v is not None for v in [os_["AL"], os_["K1"], os_["K2"], os_["ACD"]]):
+        rtxt2 = ocr_text(preprocess_for_ocr(right), psm="11")
+        os_ = _parse_eye_text(rtxt2)
+
+    ok = all(v is not None for v in [od["AL"], od["K1"], od["K2"], od["ACD"],
+                                     os_["AL"], os_["K1"], os_["K2"], os_["ACD"]])
+    return {"OD": od, "OS": os_} if ok else {}
 
 # =========================
-# Upload do PDF (Cloud-friendly)
+# Upload do PDF (simples, sem sliders/controles)
 # =========================
 MAX_MB = 80
 arquivo = st.file_uploader("Upload do PDF do exame", type=["pdf"], accept_multiple_files=False)
@@ -198,14 +173,10 @@ if "pdf_bytes" not in st.session_state:
 if "pdf_name" not in st.session_state:
     st.session_state.pdf_name = None
 
-texto_topo = ""
-paginas = []
-img_preview = None
-
 if arquivo is not None:
-    st.caption(f"📄 Arquivo: **{arquivo.name}** | MIME: `{arquivo.type}` | Tamanho: {arquivo.size/1_048_576:.2f} MB")
+    st.caption(f"📄 Arquivo: **{arquivo.name}** · {arquivo.size/1_048_576:.2f} MB")
     if arquivo.type not in {"application/pdf", "application/x-pdf", "application/acrobat"}:
-        st.error("O arquivo não parece ser um PDF válido. Tente outro.")
+        st.error("O arquivo não parece ser um PDF válido.")
         st.stop()
     if arquivo.size > MAX_MB * 1024 * 1024:
         st.error(f"PDF maior que {MAX_MB} MB. Envie um arquivo menor.")
@@ -219,108 +190,94 @@ if arquivo is not None:
         st.session_state.pdf_name = arquivo.name
     except Exception as e:
         st.error("Falha ao carregar bytes do PDF.")
-        st.exception(e)
+        with st.expander("Detalhes técnicos (upload)"):
+            st.exception(e)
         st.stop()
 
-# Converte apenas a 1ª página com boa qualidade
-if st.session_state.pdf_bytes:
-    try:
-        paginas = convert_from_bytes(
-            st.session_state.pdf_bytes,
-            dpi=OCR_DPI,
-            first_page=1,
-            last_page=1,
-            fmt="png"
-        )
-    except Exception as e:
-        st.error("Erro ao converter PDF em imagem. No Streamlit Cloud, adicione 'poppler-utils'.")
-        st.exception(e)
-        paginas = []
-
-    if paginas:
-        try:
-            texto_topo = ocr_top_header_get_text(paginas[0], top_ratio=0.22, lang="por+eng")
-        except Exception:
-            texto_topo = ""
-        try:
-            img_preview = paginas[0].copy()
-            img_preview.thumbnail((1100, 1100))
-        except Exception:
-            img_preview = None
-
 # =========================
-# Extrações (OCR) — metades, parser exato
+# Renderização + OCR com fallbacks silenciosos
 # =========================
+pag_img = None
 dados = {}
-if paginas:
-    dados = extrair_biometria_dupla_por_metades(paginas, lang="por+eng")
+patient_detected = ""
 
-patient_detected = extrair_patient_name_do_header(texto_topo) if texto_topo else ""
+def try_render_and_extract(pdf_bytes: bytes):
+    """Tenta (p1@400) → (p2@400) → (p1@480). Retorna (pil_image, dados_dict, patient_name)."""
+    # tentativa 1: página 1 @400 dpi
+    for (first, last, dpi) in [(1,1,400), (2,2,400), (1,1,480)]:
+        try:
+            pages = convert_from_bytes(pdf_bytes, dpi=dpi, first_page=first, last_page=last, fmt="png")
+        except Exception as e:
+            continue
+        if not pages:
+            continue
+        page = pages[0].convert("RGB")
+        # extrai nome (topo) a partir da página sem binarização forte
+        try:
+            header_txt = ocr_top_header_get_text(page, top_ratio=0.22)
+            name_guess = extrair_patient_name_do_header(header_txt) if header_txt else ""
+        except Exception:
+            name_guess = ""
+        # extrai OD/OS por metades
+        try:
+            got = extrair_biometria_dupla_por_metades(page)
+        except Exception:
+            got = {}
+        if got:
+            return page, got, name_guess
+        # se não conseguiu, continua para próximo fallback
+    # nenhuma extração
+    try:
+        # ao menos devolve p1@400 para prévia
+        pages = convert_from_bytes(pdf_bytes, dpi=400, first_page=1, last_page=1, fmt="png")
+        page = pages[0].convert("RGB") if pages else None
+    except Exception:
+        page = None
+    return page, {}, ""
 
+if st.session_state.pdf_bytes:
+    pag_img, dados, patient_detected = try_render_and_extract(st.session_state.pdf_bytes)
+
+# =========================
+# Sessão principal (somente a UI “Verifique e edite os dados”)
+# =========================
 st.divider()
 
-# =============== Estado global ===============
-if "selected_iol" not in st.session_state:
-    st.session_state.selected_iol = "— selecionar —"
-if "a_constant_val" not in st.session_state:
-    st.session_state.a_constant_val = ""
-if "lens_factor_val" not in st.session_state:
-    st.session_state.lens_factor_val = ""
-if "tables" not in st.session_state:
-    st.session_state.tables = None
-if "used_browser" not in st.session_state:
-    st.session_state.used_browser = None
-if "auto_run" not in st.session_state:
-    st.session_state.auto_run = False
-
-def on_iol_change():
-    preset = PRESET_BY_LABEL.get(st.session_state.selected_iol, {"a_constant": "", "lens_factor": ""})
-    st.session_state.a_constant_val = preset.get("a_constant", "") or ""
-    st.session_state.lens_factor_val = preset.get("lens_factor", "") or ""
-    st.session_state.auto_run = (st.session_state.selected_iol != "— selecionar —")
-
-def on_ac_input_change():
-    st.session_state.a_constant_val = st.session_state.get("ac_input", "").strip()
-    if st.session_state.a_constant_val:
-        st.session_state.selected_iol = st.session_state.selected_iol or "— selecionar —"
-        st.session_state.auto_run = True
-
-def on_lf_input_change():
-    st.session_state.lens_factor_val = st.session_state.get("lf_input", "").strip()
-    if st.session_state.lens_factor_val:
-        st.session_state.selected_iol = st.session_state.selected_iol or "— selecionar —"
-        st.session_state.auto_run = True
-
-# =========================
-# UI principal (enxuta)
-# =========================
 if st.session_state.pdf_bytes is None:
     st.info("Faça o upload do PDF para extrair os dados.")
 else:
     col_preview, col_form = st.columns([1, 1.2], gap="large")
 
     with col_preview:
-        if img_preview is not None:
-            st.image(img_preview, caption="Prévia da 1ª página do PDF", use_column_width=True)
+        if pag_img is not None:
+            try:
+                # compatível com versões antigas do Streamlit Cloud:
+                st.image(pag_img, caption="Prévia da 1ª página do PDF", use_column_width=True)
+            except Exception as e:
+                st.warning("Não consegui renderizar a prévia da imagem.")
+                with st.expander("Detalhes técnicos (st.image)"):
+                    st.exception(e)
         else:
             st.info("Sem prévia disponível.")
 
     with col_form:
         if not dados:
-            st.warning("Não consegui extrair automaticamente. Preencha/ajuste manualmente.")
-            dados = {"OD": {"AL": 23.50, "K1": 43.50, "K2": 44.00, "ACD": 3.20},
-                     "OS": {"AL": 23.60, "K1": 43.80, "K2": 44.05, "ACD": 3.30}}
+            st.warning("Não consegui extrair automaticamente. Vou preencher valores padrão para edição manual.")
+            dados = {
+                "OD": {"AL": 23.50, "K1": 43.50, "K2": 44.00, "ACD": 3.20},
+                "OS": {"AL": 23.60, "K1": 43.80, "K2": 44.05, "ACD": 3.30},
+            }
 
         st.subheader("Verifique e edite os dados")
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("OD (Right)")
+            st.markdown("**OD (Right)**")
             al_od = st.number_input("AL (OD, mm)", value=float(dados["OD"]["AL"]), format="%.2f")
             k1_od = st.number_input("K1 (OD, D)", value=float(dados["OD"]["K1"]), format="%.2f")
             k2_od = st.number_input("K2 (OD, D)", value=float(dados["OD"]["K2"]), format="%.2f")
             acd_od = st.number_input("ACD (OD, mm)", value=float(dados["OD"]["ACD"]), format="%.2f")
         with c2:
-            st.markdown("OS (Left)")
+            st.markdown("**OS (Left)**")
             al_os = st.number_input("AL (OS, mm)", value=float(dados["OS"]["AL"]), format="%.2f")
             k1_os = st.number_input("K1 (OS, D)", value=float(dados["OS"]["K1"]), format="%.2f")
             k2_os = st.number_input("K2 (OS, D)", value=float(dados["OS"]["K2"]), format="%.2f")
@@ -334,6 +291,38 @@ else:
             patient_name = st.text_input("Patient Name (obrigatório)", value=patient_detected or "AutoFill")
 
         st.subheader("Constante da Lente")
+        # Estado global
+        if "selected_iol" not in st.session_state:
+            st.session_state.selected_iol = "— selecionar —"
+        if "a_constant_val" not in st.session_state:
+            st.session_state.a_constant_val = ""
+        if "lens_factor_val" not in st.session_state:
+            st.session_state.lens_factor_val = ""
+        if "tables" not in st.session_state:
+            st.session_state.tables = None
+        if "used_browser" not in st.session_state:
+            st.session_state.used_browser = None
+        if "auto_run" not in st.session_state:
+            st.session_state.auto_run = False
+
+        def on_iol_change():
+            preset = PRESET_BY_LABEL.get(st.session_state.selected_iol, {"a_constant": "", "lens_factor": ""})
+            st.session_state.a_constant_val = preset.get("a_constant", "") or ""
+            st.session_state.lens_factor_val = preset.get("lens_factor", "") or ""
+            st.session_state.auto_run = (st.session_state.selected_iol != "— selecionar —")
+
+        def on_ac_input_change():
+            st.session_state.a_constant_val = st.session_state.get("ac_input", "").strip()
+            if st.session_state.a_constant_val:
+                st.session_state.selected_iol = st.session_state.selected_iol or "— selecionar —"
+                st.session_state.auto_run = True
+
+        def on_lf_input_change():
+            st.session_state.lens_factor_val = st.session_state.get("lf_input", "").strip()
+            if st.session_state.lens_factor_val:
+                st.session_state.selected_iol = st.session_state.selected_iol or "— selecionar —"
+                st.session_state.auto_run = True
+
         const_tipo = st.radio(
             "Escolha como quer preencher",
             ["Lens Factor", "A-constant"],
@@ -381,9 +370,10 @@ else:
 
         st.markdown("[Abrir calculadora Barrett](https://calc.apacrs.org/barrett_universal2105/)", unsafe_allow_html=True)
 
+# =========================
+# Execução (Selenium)
+# =========================
 st.divider()
-
-# ======= Execução Selenium =======
 st.subheader("Execução")
 headless = st.checkbox("Executar em modo headless (sem abrir janela)", value=True)
 nav_choice = st.radio("Navegador", ["Firefox", "Chrome"], index=0, horizontal=True)
@@ -405,7 +395,7 @@ def build_firefox(headless_flag: bool):
     opts = webdriver.FirefoxOptions()
     if headless_flag:
         opts.add_argument("-headless")
-    service = FirefoxService()
+    service = FirefoxService()  # Selenium Manager resolve geckodriver
     return webdriver.Firefox(service=service, options=opts)
 
 def build_chrome(headless_flag: bool):
@@ -420,9 +410,11 @@ def build_chrome(headless_flag: bool):
     opts.add_argument("--no-first-run")
     opts.add_argument("--no-default-browser-check")
     opts.add_argument("--remote-allow-origins=*")
+    # limpar ENV que aponte para chromedriver antigo
     for var in ["WEBDRIVER_CHROME_DRIVER", "webdriver.chrome.driver", "CHROMEDRIVER", "CHROMEWEBDRIVER"]:
         if var in os.environ:
             del os.environ[var]
+    # filtra PATH para não confundir o Selenium Manager
     old_path = os.environ.get("PATH", "")
     parts = old_path.split(os.pathsep)
     filtered = []
@@ -481,13 +473,14 @@ def run_selenium_and_fetch(preferred: str):
                     pass
 
             # Constantes manuais (sobrescrevem)
-            if const_tipo == "Lens Factor" and st.session_state.get("lens_factor_val", "").strip():
+            if st.session_state.get("const_tipo_radio") == "Lens Factor" and st.session_state.get("lens_factor_val", "").strip():
                 fill_by_id("MainContent_LensFactor", st.session_state["lens_factor_val"].strip())
-            if const_tipo == "A-constant" and st.session_state.get("a_constant_val", "").strip():
+            if st.session_state.get("const_tipo_radio") == "A-constant" and st.session_state.get("a_constant_val", "").strip():
                 fill_by_id("MainContent_Aconstant", st.session_state["a_constant_val"].strip())
 
             # Calcular
             wait.until(EC.element_to_be_clickable((By.ID, "MainContent_Button1"))).click()
+            # Aba Universal Formula
             driver.execute_script("__doPostBack('ctl00$MainContent$menuTabs','1');")
 
             # Tabelas
@@ -522,13 +515,15 @@ if st.session_state.get("auto_run"):
             st.session_state.tables = tables
             st.session_state.used_browser = used
         except Exception as e:
-            st.error(f"Erro ao executar Selenium: {e}")
+            st.error("Erro ao executar Selenium.")
+            with st.expander("Detalhes técnicos (Selenium)"):
+                st.exception(e)
 
-# Persistir nomes digitados
+# Persistir nomes para o Selenium
 st.session_state["doctor_name_val"] = locals().get("doctor_name", st.session_state.get("doctor_name_val", "Luis"))
 st.session_state["patient_name_val"] = locals().get("patient_name", st.session_state.get("patient_name_val", "AutoFill"))
 
-# --------- Botão Recalcular ---------
+# Botão Recalcular manual
 if st.button("Recalcular"):
     with st.status("Executando calculadora...", expanded=False):
         try:
@@ -536,9 +531,11 @@ if st.button("Recalcular"):
             st.session_state.tables = tables
             st.session_state.used_browser = used
         except Exception as e:
-            st.error(f"Erro ao executar Selenium: {e}")
+            st.error("Erro ao executar Selenium.")
+            with st.expander("Detalhes técnicos (Selenium)"):
+                st.exception(e)
 
-# --------- Exibição das tabelas importadas ---------
+# Exibição das tabelas importadas
 if st.session_state.get("tables"):
     st.success(f"Tabelas importadas com sucesso (navegador: {st.session_state.get('used_browser')}).")
     colod, colos = st.columns(2)
